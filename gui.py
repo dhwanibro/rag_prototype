@@ -3,14 +3,12 @@ from sentence_transformers import SentenceTransformer, util
 import pandas as pd
 from groq import Groq
 import os
-from dotenv import load_dotenv
 
-load_dotenv()
+# Hardcode your Groq API key here
+API_KEY = "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"  # Replace with your actual API key
 
-# Load Groq API key
-API_KEY = os.getenv("GROQ_API_KEY")
-if not API_KEY:
-    raise ValueError("GROQ_API_KEY not found in environment variables")
+# Hardcode the FAQ file path
+FAQ_FILE_PATH = "faq.xlsx"  # Make sure this file is in the same directory as your script
 
 groq_client = Groq(api_key=API_KEY)
 
@@ -110,13 +108,9 @@ You should:
         help="Choose the Groq model for generating AI responses"
     )
 
-# Upload FAQ Excel
-faq_path = "faq.xlsx"
-faq_df = load_faq_embeddings(faq_path)
-
-
-if faq_file:
-    faq_df = load_faq_embeddings(faq_file)
+# Load FAQ data from hardcoded path
+if os.path.exists(FAQ_FILE_PATH):
+    faq_df = load_faq_embeddings(FAQ_FILE_PATH)
     
     # Show Top-K slider
     k = st.slider("Select number of relevant answers to retrieve (Top K)", min_value=1, max_value=10, value=3)
@@ -164,7 +158,8 @@ if faq_file:
                 st.markdown("---")
 
 else:
-    st.info("👆 Please upload an FAQ Excel file to get started.")
+    st.error(f"❌ FAQ file not found at: {FAQ_FILE_PATH}")
+    st.info("Please make sure 'faq.xlsx' is in the same directory as your script.")
     
     # Instructions
     with st.expander("📋 Instructions"):
@@ -179,7 +174,8 @@ else:
         4. **Add new information** manually if needed
         
         ### Setup Requirements:
-        - Add your Groq API key as environment variable `GROQ_API_KEY`
+        - Replace the hardcoded API key with your actual Groq API key
+        - Make sure 'faq.xlsx' file is in the same directory as your script
         - Excel file should have 'Question' and 'Answer' columns
         
         ### How it works:
