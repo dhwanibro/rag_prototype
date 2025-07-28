@@ -13,7 +13,7 @@ from datetime import datetime
 import json
 
 # Hardcode your Groq API key here
-API_KEY = "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"  # Replace with your actual API key
+API_KEY = "replace"  # Replace with your actual API key
 
 # Hardcode the FAQ file path
 FAQ_FILE_PATH = "faq.xlsx"  # Make sure this file is in the same directory as your script
