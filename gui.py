@@ -13,7 +13,7 @@ from datetime import datetime
 import json
 
 # Hardcode your Groq API key here
-API_KEY = "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"  # Replace with your actual API key
+API_KEY = "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"  # Replace with your actual API key
 
 # Hardcode the FAQ file path
 FAQ_FILE_PATH = "faq.xlsx"  # Make sure this file is in the same directory as your script
@@ -27,6 +27,10 @@ if 'pdf_content' not in st.session_state:
     st.session_state.pdf_content = ""
 if 'pdf_filename' not in st.session_state:
     st.session_state.pdf_filename = ""
+if 'processed_files' not in st.session_state:
+    st.session_state.processed_files = set()
+if 'last_question' not in st.session_state:
+    st.session_state.last_question = ""
 
 # Load model once
 @st.cache_resource
@@ -223,6 +227,8 @@ You should:
     # Clear chat history button
     if st.button("🗑️ Clear Chat History"):
         st.session_state.chat_history = []
+        st.session_state.processed_files = set()
+        st.session_state.last_question = ""
         st.success("Chat history cleared!")
 
 # Load FAQ data
@@ -232,6 +238,13 @@ faq_df = load_faq_embeddings(FAQ_FILE_PATH)
 def process_uploaded_file(uploaded_file):
     """Process uploaded PDF file and update session state"""
     if uploaded_file is not None:
+        # Create a unique identifier for the file
+        file_id = f"{uploaded_file.name}_{uploaded_file.size}"
+        
+        # Check if this file has already been processed
+        if file_id in st.session_state.processed_files:
+            return False
+        
         with st.spinner("📖 Processing PDF..."):
             # Extract text from PDF
             extracted_text = extract_text_from_pdf(uploaded_file)
@@ -239,6 +252,7 @@ def process_uploaded_file(uploaded_file):
             if extracted_text:
                 st.session_state.pdf_content = extracted_text
                 st.session_state.pdf_filename = uploaded_file.name
+                st.session_state.processed_files.add(file_id)
                 
                 # Try to parse as receipt
                 receipt_info = parse_receipt_info(extracted_text)
@@ -249,7 +263,10 @@ def process_uploaded_file(uploaded_file):
                     receipt_details = []
                     for key, value in receipt_info.items():
                         if value:
-                            receipt_details.append(f"{key.title()}: {value}")
+                            if isinstance(value, list):
+                                receipt_details.append(f"{key.title()}: {', '.join(str(v) for v in value[:2])}")
+                            else:
+                                receipt_details.append(f"{key.title()}: {value}")
                     if receipt_details:
                         receipt_summary += f"\n🧾 Detected: {', '.join(receipt_details[:3])}"
                 
@@ -303,80 +320,82 @@ with tab1:
         user_question = st.text_input("Ask a question or upload a PDF:", key="chat_input", label_visibility="collapsed", placeholder="Type your message here...")
     
     with col2:
-        # Custom CSS for minimal upload button
-        st.markdown("""
-        <style>
-        .upload-btn {
-            background: none;
-            border: none;
-            font-size: 18px;
-            cursor: pointer;
-            padding: 8px;
-            border-radius: 6px;
-            transition: background-color 0.2s;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            width: 40px;
-            height: 38px;
-        }
-        .upload-btn:hover {
-            background-color: #f0f2f6;
-        }
-        .stFileUploader > div > div > div {
-            display: none;
-        }
-        .stFileUploader > div > section {
-            border: none !important;
-            background: none !important;
-            padding: 0 !important;
-        }
-        .stFileUploader > div > section > div {
-            display: none;
-        }
-        .stFileUploader {
-            width: 40px !important;
-        }
-        .stFileUploader label {
-            border: 1px solid #d1d5db !important;
-            border-radius: 6px !important;
-            padding: 8px !important;
-            background: white !important;
-            cursor: pointer !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            width: 40px !important;
-            height: 38px !important;
-            font-size: 16px !important;
-            transition: all 0.2s !important;
-        }
-        .stFileUploader label:hover {
-            background-color: #f9fafb !important;
-            border-color: #9ca3af !important;
-        }
-        </style>
-        """, unsafe_allow_html=True)
-        
-        # Minimal file upload button
+        # Create a simple file uploader with minimal styling
         uploaded_file = st.file_uploader(
-            "📎", 
+            "",  # Empty label
             type="pdf",
             help="Upload PDF",
             label_visibility="collapsed",
             key="file_upload"
         )
+        
+        # Apply custom CSS to make it look like a button
+        st.markdown("""
+        <style>
+        /* Target the file uploader container */
+        .stFileUploader {
+            width: 100% !important;
+        }
+        
+        /* Hide the drag and drop text and make it look like a button */
+        .stFileUploader > div > div {
+            border: 1px solid #d1d5db !important;
+            border-radius: 6px !important;
+            background: white !important;
+            padding: 0 !important;
+            height: 38px !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+        }
+        
+        /* Hide the drag and drop text */
+        .stFileUploader > div > div > div > div {
+            display: none !important;
+        }
+        
+        /* Style the browse files button to look like our upload button */
+        .stFileUploader > div > div > button {
+            border: none !important;
+            background: transparent !important;
+            color: #374151 !important;
+            font-size: 16px !important;
+            padding: 0 !important;
+            height: 100% !important;
+            width: 100% !important;
+        }
+        
+        /* Add our paperclip icon */
+        .stFileUploader > div > div > button:before {
+            content: "📎";
+            font-size: 16px;
+        }
+        
+        /* Hide the original button text */
+        .stFileUploader > div > div > button > div {
+            display: none !important;
+        }
+        
+        /* Hover effects */
+        .stFileUploader > div > div:hover {
+            background-color: #f9fafb !important;
+            border-color: #9ca3af !important;
+        }
+        </style>
+        """, unsafe_allow_html=True)
     
     with col3:
         send_button = st.button("Send", type="primary", use_container_width=True)
     
     # Handle file upload
     if uploaded_file is not None:
-        if process_uploaded_file(uploaded_file):
-            st.rerun()  # Refresh to show the uploaded file in chat
+        process_uploaded_file(uploaded_file)
     
     # Handle text input
-    if (user_question and send_button) or (user_question and st.session_state.get('enter_pressed', False)):
+    if user_question and send_button and user_question != st.session_state.last_question:
+        # Store the current question to avoid reprocessing
+        st.session_state.last_question = user_question
+        
         with st.spinner("🤔 Priya is thinking..."):
             # Retrieve relevant FAQs
             results = retrieve_top_k(user_question, faq_df, k)
@@ -398,13 +417,13 @@ with tab1:
                 'timestamp': datetime.now().isoformat()
             })
             
-            # Clear input and refresh
-            st.session_state.chat_input = ""
+            # Rerun to refresh the chat display
             st.rerun()
     
     # Show source information for last response if available
-    if st.session_state.chat_history and user_question:
-        results = retrieve_top_k(user_question, faq_df, k)
+    if st.session_state.chat_history and st.session_state.chat_history[-1].get('type') != 'system':
+        last_user_question = st.session_state.chat_history[-1]['user']
+        results = retrieve_top_k(last_user_question, faq_df, k)
         if not results.empty:
             with st.expander("📚 Source Information"):
                 for i, row in results.iterrows():
