@@ -1,9 +1,13 @@
 streamlit
-pip
 sentence-transformers
 pandas
-groq
+google-generativeai
+PyPDF2
+pdfplumber
+Pillow
+pytesseract
 openpyxl
 torch
 transformers
+numpy
 scikit-learn

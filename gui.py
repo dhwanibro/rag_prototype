@@ -1,7 +1,7 @@
 import streamlit as st
 from sentence_transformers import SentenceTransformer, util
 import pandas as pd
-from groq import Groq
+import google.generativeai as genai
 import os
 import PyPDF2
 import pdfplumber
@@ -12,13 +12,14 @@ import re
 from datetime import datetime
 import json
 
-# Hardcode your Groq API key here
-API_KEY = "replace"  # Replace with your actual API key
+# Hardcode your Gemini API key here
+GEMINI_API_KEY = "my key"  # Replace with your actual Gemini API key
 
 # Hardcode the FAQ file path
 FAQ_FILE_PATH = "faq.xlsx"  # Make sure this file is in the same directory as your script
 
-groq_client = Groq(api_key=API_KEY)
+# Configure Gemini
+genai.configure(api_key=GEMINI_API_KEY)
 
 # Initialize session state for chat history
 if 'chat_history' not in st.session_state:
@@ -136,10 +137,10 @@ def retrieve_top_k(user_question, faq_df, k=5):
     top_k = faq_df.sort_values(by='similarity', ascending=False).head(k)
     return top_k
 
-# Generate AI response with chat history and PDF context
+# Generate AI response with chat history and PDF context using Gemini
 def generate_ai_response(user_question, relevant_context, system_prompt, selected_model, chat_history, pdf_content=""):
-    if not groq_client:
-        return "Groq client not initialized. Please check your API key."
+    if not GEMINI_API_KEY or GEMINI_API_KEY == "your_gemini_api_key_here":
+        return "Gemini API key not configured. Please check your API key."
     
     # Prepare context from retrieved FAQs
     faq_context = ""
@@ -149,52 +150,85 @@ def generate_ai_response(user_question, relevant_context, system_prompt, selecte
     
     # Prepare chat history context
     history_context = ""
+    is_first_message = len(chat_history) == 0
     if chat_history:
-        recent_history = chat_history[-5:]  # Last 5 exchanges
+        recent_history = chat_history[-3:]  # Last 3 exchanges for better context
         history_context = "\n".join([f"User: {h['user']}\nPriya: {h['assistant']}" 
-                                   for h in recent_history])
+                                   for h in recent_history if h.get('type') != 'system'])
     
     # Prepare PDF context
     pdf_context = ""
     if pdf_content:
         pdf_context = f"\n\nUploaded Document Content:\n{pdf_content[:2000]}..."  # Limit to 2000 chars
     
-    messages = [
-        {
-            "role": "system",
-            "content": system_prompt
-        },
-        {
-            "role": "user", 
-            "content": f"""You are Priya, a helpful assistant at Narayan Seva Sansthan (NSS). 
+    # Create context-aware prompt
+    conversation_context = ""
+    if history_context:
+        conversation_context = f"\n\nPREVIOUS CONVERSATION:\n{history_context}\n"
+    
+    # Combine all context
+    full_prompt = f"""{system_prompt}
 
-Recent Chat History:
-{history_context}
-
-FAQ Context:
+{conversation_context}FAQ KNOWLEDGE BASE:
 {faq_context}
 
 {pdf_context}
 
-Current User Question: {user_question}
+INSTRUCTIONS:
+- This is {"the user's FIRST message" if is_first_message else "a FOLLOW-UP message in an ongoing conversation"}
+- {"Introduce yourself with 'Jai Siyaram! I'm Priya, an AI assistant from Narayan Seva Sansthan'" if is_first_message else "Continue the conversation naturally without repeating introductions"}
+- Be contextually aware of previous messages
+- Provide helpful, accurate responses based on available information
+- If referencing costs or donations, be clear about amounts and options
 
-Please provide a helpful response based on all available context. If you're referencing information from the uploaded document, mention it clearly. Maintain conversation continuity with the chat history."""
-        }
-    ]
+CURRENT USER QUESTION: {user_question}
+
+Response:"""
     
     try:
-        chat_completion = groq_client.chat.completions.create(
-            messages=messages,
-            model=selected_model,
-            temperature=0.7,
-            max_tokens=300
+        # Initialize Gemini model
+        model_name = "gemini-1.5-flash" if selected_model == "gemini-flash" else "gemini-1.5-pro"
+        gemini_model = genai.GenerativeModel(model_name)
+        
+        # Generate response
+        response = gemini_model.generate_content(
+            full_prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.7,
+                max_output_tokens=400,
+            )
         )
-        return chat_completion.choices[0].message.content
+        
+        return response.text
     except Exception as e:
         return f"Error generating AI response: {str(e)}"
 
 # -------------- Streamlit UI ----------------
 st.title("📚 Enhanced FAQ System with PDF Processing & Chat History")
+
+# Custom CSS for better styling
+st.markdown("""
+<style>
+    /* Chat message styling */
+    .chat-message {
+        padding: 1rem;
+        margin: 0.5rem 0;
+        border-radius: 0.5rem;
+        border-left: 4px solid #3b82f6;
+        background-color: #f8fafc;
+    }
+    
+    .user-message {
+        border-left-color: #10b981;
+        background-color: #f0fdf4;
+    }
+    
+    .assistant-message {
+        border-left-color: #6366f1;
+        background-color: #faf5ff;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # Sidebar for configuration
 with st.sidebar:
@@ -204,21 +238,26 @@ with st.sidebar:
     system_prompt = st.text_area(
         "System Prompt",
         value="""You are Priya, a helpful AI assistant working at Narayan Seva Sansthan (NSS). You answer questions based on provided FAQ context, uploaded documents, and chat history. 
-You should:
-- Introduce yourself as Priya from NSS when greeting new users
-- Provide accurate answers based on the given context
+
+IMPORTANT GUIDELINES:
+- Only introduce yourself as "Jai Siyaram! I'm Priya, an AI assistant from Narayan Seva Sansthan" for the FIRST message or when greeting new users
+- For follow-up questions in the same conversation, respond naturally without repeating the full introduction
+- Maintain conversation flow by referencing previous messages when relevant
+- Be contextually aware - if someone asks a follow-up question, acknowledge their previous question
+- Provide clear, helpful answers based on the given context
+- Use "Jai Siyaram!" as a greeting only when appropriate (first interaction or after long gaps)
+- Be conversational and natural, not robotic or repetitive
 - Reference uploaded documents when relevant
-- Maintain conversation continuity
-- Be concise but comprehensive
-- Use a friendly and professional tone""",
-        height=200
+- Be concise but comprehensive""",
+        height=250
     )
     
-    # Model selection
+    # Model selection for Gemini
     model_choice = st.selectbox(
-        "Select Groq Model",
-        ["llama-3.1-8b-instant", "llama-3.1-70b-versatile", "mixtral-8x7b-32768"],
-        index=0
+        "Select Gemini Model",
+        ["gemini-flash", "gemini-pro"],
+        index=0,
+        help="Flash is faster, Pro is more capable"
     )
     
     # Top-K slider
@@ -303,99 +342,39 @@ with tab1:
                     # System messages (file uploads)
                     st.info(chat['assistant'])
                 else:
-                    # Regular chat messages
-                    with st.container():
-                        st.markdown(f"**You:** {chat['user']}")
-                        st.markdown(f"**Priya:** {chat['assistant']}")
+                    # Regular chat messages with better styling
+                    col1, col2 = st.columns([1, 10])
+                    with col2:
+                        st.markdown(f'<div class="chat-message user-message"><strong>You:</strong> {chat["user"]}</div>', unsafe_allow_html=True)
+                        st.markdown(f'<div class="chat-message assistant-message"><strong>Priya:</strong> {chat["assistant"]}</div>', unsafe_allow_html=True)
                         if i < len(st.session_state.chat_history) - 1:
-                            st.markdown("---")
+                            st.markdown("<br>", unsafe_allow_html=True)
     
-    # Chat input area with upload button
+    # Chat input area
     st.markdown("---")
     
-    # Create columns for input and buttons
-    col1, col2, col3 = st.columns([7, 0.8, 1])
+    # Simple file upload
+    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+    
+    # Create columns for input and send button
+    col1, col2 = st.columns([9, 1])
     
     with col1:
-        user_question = st.text_input("Ask a question or upload a PDF:", key="chat_input", label_visibility="collapsed", placeholder="Type your message here...")
+        # Use a unique key that changes to clear input
+        input_key = f"chat_input_{len(st.session_state.chat_history)}"
+        user_question = st.text_input("Ask a question:", key=input_key, label_visibility="collapsed", placeholder="Type your message here...")
     
     with col2:
-        # Create a simple file uploader with minimal styling
-        uploaded_file = st.file_uploader(
-            "",  # Empty label
-            type="pdf",
-            help="Upload PDF",
-            label_visibility="collapsed",
-            key="file_upload"
-        )
-        
-        # Apply custom CSS to make it look like a button
-        st.markdown("""
-        <style>
-        /* Target the file uploader container */
-        .stFileUploader {
-            width: 100% !important;
-        }
-        
-        /* Hide the drag and drop text and make it look like a button */
-        .stFileUploader > div > div {
-            border: 1px solid #d1d5db !important;
-            border-radius: 6px !important;
-            background: white !important;
-            padding: 0 !important;
-            height: 38px !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-        }
-        
-        /* Hide the drag and drop text */
-        .stFileUploader > div > div > div > div {
-            display: none !important;
-        }
-        
-        /* Style the browse files button to look like our upload button */
-        .stFileUploader > div > div > button {
-            border: none !important;
-            background: transparent !important;
-            color: #374151 !important;
-            font-size: 16px !important;
-            padding: 0 !important;
-            height: 100% !important;
-            width: 100% !important;
-        }
-        
-        /* Add our paperclip icon */
-        .stFileUploader > div > div > button:before {
-            content: "📎";
-            font-size: 16px;
-        }
-        
-        /* Hide the original button text */
-        .stFileUploader > div > div > button > div {
-            display: none !important;
-        }
-        
-        /* Hover effects */
-        .stFileUploader > div > div:hover {
-            background-color: #f9fafb !important;
-            border-color: #9ca3af !important;
-        }
-        </style>
-        """, unsafe_allow_html=True)
-    
-    with col3:
         send_button = st.button("Send", type="primary", use_container_width=True)
     
     # Handle file upload
     if uploaded_file is not None:
-        process_uploaded_file(uploaded_file)
+        if process_uploaded_file(uploaded_file):
+            st.success(f"✅ Processed: {uploaded_file.name}")
+            st.rerun()
     
-    # Handle text input
-    if user_question and send_button and user_question != st.session_state.last_question:
-        # Store the current question to avoid reprocessing
-        st.session_state.last_question = user_question
-        
+    # Handle text input - auto-clear after sending
+    if user_question and send_button:
         with st.spinner("🤔 Priya is thinking..."):
             # Retrieve relevant FAQs
             results = retrieve_top_k(user_question, faq_df, k)
@@ -417,7 +396,10 @@ with tab1:
                 'timestamp': datetime.now().isoformat()
             })
             
-            # Rerun to refresh the chat display
+            # Clear the last question to avoid duplication
+            st.session_state.last_question = ""
+            
+            # Rerun to refresh chat and clear input (new key will clear input)
             st.rerun()
     
     # Show source information for last response if available
@@ -475,12 +457,18 @@ with st.expander("📋 How to Use This System"):
     4. **Knowledge Management** - Add custom FAQ entries
     5. **Chat History** - Maintains context across conversations
     6. **Semantic Search** - Find relevant information from all sources
+    7. **Gemini AI** - Powered by Google's Gemini AI models
     
     ### How to Use:
-    1. **Start Chatting** - Go to Chat tab and ask questions
-    2. **Upload Documents** - Use PDF Upload tab for document-based queries
+    1. **Start Chatting** - Type your question in the input field
+    2. **Upload Documents** - Click the 📎 icon to upload PDF files
     3. **Add Knowledge** - Use Manage Knowledge tab to add custom FAQs
     4. **Configure Settings** - Use sidebar to adjust AI behavior
+    
+    ### Setup:
+    1. Replace `GEMINI_API_KEY` with your actual Gemini API key
+    2. Make sure `faq.xlsx` file exists in the same directory
+    3. Install required packages: `pip install streamlit sentence-transformers pandas google-generativeai PyPDF2 pdfplumber pillow pytesseract openpyxl`
     
     ### Supported Document Types:
     - Receipts and invoices
