@@ -169,26 +169,3 @@ Edit the system prompt in the sidebar to change how Priya responds:
 3. Make your changes
 4. Test thoroughly
 5. Submit a pull request
-
-## 📞 Support
-
-For issues and questions:
-- Check the troubleshooting section
-- Review Streamlit documentation
-- Check Gemini API documentation
-- Create an issue with detailed error information
-
-## 📄 License
-
-This project is open source and available under the MIT License.
-
-## 🙏 Acknowledgments
-
-- **Google Gemini AI** for advanced language capabilities
-- **Streamlit** for the amazing web framework
-- **Sentence Transformers** for semantic search
-- **Narayan Seva Sansthan** for the inspiration
-
----
-
-**Made with ❤️ for better customer service and information accessibility**
