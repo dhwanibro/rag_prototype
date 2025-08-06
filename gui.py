@@ -13,7 +13,7 @@ import json
 import hashlib
 
 # Hardcode your Gemini API key here
-GEMINI_API_KEY = "ur key"  # Replace with your actual Gemini API key
+GEMINI_API_KEY = "AIzaSyBlJspbf9LcUBcHuercP8Lyn_-n7uQX0E"  # Replace with your actual Gemini API key
 
 # Hardcode the FAQ file path
 FAQ_FILE_PATH = "faq.xlsx"  # Make sure this file is in the same directory as your script
