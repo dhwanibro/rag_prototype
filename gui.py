@@ -1,5 +1,4 @@
 import streamlit as st
-from sentence_transformers import SentenceTransformer, util
 import pandas as pd
 import google.generativeai as genai
 import os
@@ -11,9 +10,10 @@ import io
 import re
 from datetime import datetime
 import json
+import hashlib
 
 # Hardcode your Gemini API key here
-GEMINI_API_KEY = "my key"  # Replace with your actual Gemini API key
+GEMINI_API_KEY = "ur key"  # Replace with your actual Gemini API key
 
 # Hardcode the FAQ file path
 FAQ_FILE_PATH = "faq.xlsx"  # Make sure this file is in the same directory as your script
@@ -30,27 +30,69 @@ if 'pdf_filename' not in st.session_state:
     st.session_state.pdf_filename = ""
 if 'processed_files' not in st.session_state:
     st.session_state.processed_files = set()
-if 'last_question' not in st.session_state:
-    st.session_state.last_question = ""
+if 'user_exists' not in st.session_state:
+    st.session_state.user_exists = False
 
-# Load model once
-@st.cache_resource
-def load_model():
-    return SentenceTransformer('all-MiniLM-L6-v2')
+# User management functions
+def generate_user_id(identifier):
+    """Generate a consistent user ID from identifier (email/phone)"""
+    return hashlib.md5(identifier.encode()).hexdigest()[:12]
 
-model = load_model()
+def check_user_exists(identifier):
+    """Check if user already exists based on email/phone"""
+    user_file = "users.json"
+    
+    if os.path.exists(user_file):
+        try:
+            with open(user_file, 'r') as f:
+                users = json.load(f)
+            user_id = generate_user_id(identifier)
+            return user_id in users, user_id
+        except:
+            return False, generate_user_id(identifier)
+    return False, generate_user_id(identifier)
 
-# Load and embed FAQ data
+def save_user(identifier, user_data):
+    """Save user information"""
+    user_file = "users.json"
+    users = {}
+    
+    if os.path.exists(user_file):
+        try:
+            with open(user_file, 'r') as f:
+                users = json.load(f)
+        except:
+            users = {}
+    
+    user_id = generate_user_id(identifier)
+    users[user_id] = {
+        'identifier': identifier,
+        'created_at': datetime.now().isoformat(),
+        'last_active': datetime.now().isoformat(),
+        **user_data
+    }
+    
+    with open(user_file, 'w') as f:
+        json.dump(users, f, indent=2)
+    
+    return user_id
+
+# LOAD ALL FAQ DATA - No limits, load everything
 @st.cache_data(show_spinner=False)
-def load_faq_embeddings(faq_path):
+def load_faq_data(faq_path):
+    """Load ALL FAQ data as simple text format - no limits"""
     if os.path.exists(faq_path):
         df = pd.read_excel(faq_path, engine='openpyxl')
         df = df.dropna(subset=['Question', 'Answer'])
-        df['embedding'] = df['Question'].apply(lambda x: model.encode(x, convert_to_tensor=True))
-        return df
+        
+        # Convert ALL entries to simple text format for long context
+        faq_text = ""
+        for i, row in df.iterrows():
+            faq_text += f"FAQ {i+1}:\nQ: {row['Question']}\nA: {row['Answer']}\n\n"
+        
+        return faq_text, df
     else:
-        # Return empty dataframe if file doesn't exist
-        return pd.DataFrame(columns=['Question', 'Answer', 'embedding'])
+        return "", pd.DataFrame(columns=['Question', 'Answer'])
 
 # PDF text extraction functions
 def extract_text_from_pdf(pdf_file):
@@ -58,7 +100,7 @@ def extract_text_from_pdf(pdf_file):
     text = ""
     
     try:
-        # Method 1: Try pdfplumber first (better for complex layouts)
+        # Method 1: Try pdfplumber first
         with pdfplumber.open(pdf_file) as pdf:
             for page in pdf.pages:
                 page_text = page.extract_text()
@@ -67,7 +109,7 @@ def extract_text_from_pdf(pdf_file):
         
         # If pdfplumber didn't extract much text, try PyPDF2
         if len(text.strip()) < 50:
-            pdf_file.seek(0)  # Reset file pointer
+            pdf_file.seek(0)
             pdf_reader = PyPDF2.PdfReader(pdf_file)
             for page in pdf_reader.pages:
                 page_text = page.extract_text()
@@ -97,11 +139,8 @@ def parse_receipt_info(text):
             r'TOTAL[:\s]*\$?(\d+\.?\d*)'
         ],
         'store': [
-            r'^([A-Z\s&]+)(?=\n|\r)',  # First line often contains store name
-            r'(.*?)(?=\n.*\d{3}[-.]?\d{3}[-.]?\d{4})'  # Text before phone number
-        ],
-        'items': [
-            r'(\w+.*?)[\s]*\$(\d+\.?\d*)',  # Item name followed by price
+            r'^([A-Z\s&]+)(?=\n|\r)',
+            r'(.*?)(?=\n.*\d{3}[-.]?\d{3}[-.]?\d{4})'
         ]
     }
     
@@ -109,93 +148,64 @@ def parse_receipt_info(text):
         for pattern in pattern_list:
             matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
             if matches:
-                if field == 'items':
-                    receipt_info[field] = matches[:10]  # Limit to first 10 items
-                else:
-                    receipt_info[field] = matches[0] if isinstance(matches[0], str) else matches[0][0] if matches[0] else ""
+                receipt_info[field] = matches[0] if isinstance(matches[0], str) else matches[0][0] if matches[0] else ""
                 break
     
     return receipt_info
 
-# Update embeddings after new info
-def update_faq(df, new_q, new_a):
-    new_embed = model.encode(new_q, convert_to_tensor=True)
-    new_row = pd.DataFrame([{
-        "Question": new_q,
-        "Answer": new_a,
-        "embedding": new_embed
-    }])
-    return pd.concat([df, new_row], ignore_index=True)
-
-# Retrieve top-k relevant questions
-def retrieve_top_k(user_question, faq_df, k=5):
-    if faq_df.empty:
-        return pd.DataFrame()
-    
-    question_embedding = model.encode(user_question, convert_to_tensor=True)
-    faq_df['similarity'] = faq_df['embedding'].apply(lambda x: util.cos_sim(question_embedding, x).item())
-    top_k = faq_df.sort_values(by='similarity', ascending=False).head(k)
-    return top_k
-
-# Generate AI response with chat history and PDF context using Gemini
-def generate_ai_response(user_question, relevant_context, system_prompt, selected_model, chat_history, pdf_content=""):
-    if not GEMINI_API_KEY or GEMINI_API_KEY == "your_gemini_api_key_here":
+# Generate AI response using ALL FAQ data in long context
+def generate_ai_response(user_question, faq_text, system_prompt, selected_model, chat_history, pdf_content=""):
+    if not GEMINI_API_KEY or GEMINI_API_KEY == "my key":
         return "Gemini API key not configured. Please check your API key."
     
-    # Prepare context from retrieved FAQs
-    faq_context = ""
-    if not relevant_context.empty:
-        faq_context = "\n\n".join([f"Q: {row['Question']}\nA: {row['Answer']}" 
-                              for _, row in relevant_context.iterrows()])
-    
-    # Prepare chat history context
+    # Prepare recent chat history (last 2 exchanges)
     history_context = ""
     is_first_message = len(chat_history) == 0
     if chat_history:
-        recent_history = chat_history[-3:]  # Last 3 exchanges for better context
+        recent_history = chat_history[-2:]
         history_context = "\n".join([f"User: {h['user']}\nPriya: {h['assistant']}" 
                                    for h in recent_history if h.get('type') != 'system'])
     
-    # Prepare PDF context
+    # Prepare PDF context (if any)
     pdf_context = ""
     if pdf_content:
-        pdf_context = f"\n\nUploaded Document Content:\n{pdf_content[:2000]}..."  # Limit to 2000 chars
+        pdf_context = f"\n\nUPLOADED DOCUMENT:\n{pdf_content[:1500]}..."
     
-    # Create context-aware prompt
-    conversation_context = ""
-    if history_context:
-        conversation_context = f"\n\nPREVIOUS CONVERSATION:\n{history_context}\n"
-    
-    # Combine all context
+    # LONG CONTEXT PROMPT - ALL FAQs included directly
     full_prompt = f"""{system_prompt}
 
-{conversation_context}FAQ KNOWLEDGE BASE:
-{faq_context}
+COMPLETE KNOWLEDGE BASE (All Available FAQs):
+{faq_text}
+
+RECENT CONVERSATION:
+{history_context}
 
 {pdf_context}
 
-INSTRUCTIONS:
-- This is {"the user's FIRST message" if is_first_message else "a FOLLOW-UP message in an ongoing conversation"}
-- {"Introduce yourself with 'Jai Siyaram! I'm Priya, an AI assistant from Narayan Seva Sansthan'" if is_first_message else "Continue the conversation naturally without repeating introductions"}
-- Be contextually aware of previous messages
-- Provide helpful, accurate responses based on available information
-- If referencing costs or donations, be clear about amounts and options
+CURRENT QUESTION: {user_question}
 
-CURRENT USER QUESTION: {user_question}
+Instructions:
+- Answer based on the complete FAQ knowledge base above
+- If no relevant FAQ exists, use your general knowledge about Narayan Seva Sansthan
+- Keep response short and clear (2-3 sentences max)
+- Be helpful and accurate
+- {"Greet with 'Jai Siyaram! I'm Priya'" if is_first_message else "Continue conversation naturally"}
 
 Response:"""
     
     try:
-        # Initialize Gemini model
-        model_name = "gemini-1.5-flash" if selected_model == "gemini-flash" else "gemini-1.5-pro"
+        # Initialize Gemini model - use Pro for better handling of large context
+        model_name = "gemini-1.5-pro" if selected_model == "gemini-pro" else "gemini-1.5-flash"
         gemini_model = genai.GenerativeModel(model_name)
         
-        # Generate response
+        # Generate response with controlled creativity
         response = gemini_model.generate_content(
             full_prompt,
             generation_config=genai.types.GenerationConfig(
-                temperature=0.7,
-                max_output_tokens=400,
+                temperature=0.3,
+                max_output_tokens=200,
+                top_p=0.8,
+                top_k=40
             )
         )
         
@@ -204,12 +214,36 @@ Response:"""
         return f"Error generating AI response: {str(e)}"
 
 # -------------- Streamlit UI ----------------
-st.title("📚 Enhanced FAQ System with PDF Processing & Chat History")
+st.title("📚 Complete FAQ Chatbot - All FAQs Loaded")
+
+# USER REGISTRATION/LOGIN CHECK
+if not st.session_state.user_exists:
+    st.subheader("Welcome! Please provide your details to continue")
+    
+    with st.form("user_registration"):
+        identifier = st.text_input("Email or Phone Number:", placeholder="your.email@example.com or +1234567890")
+        name = st.text_input("Your Name:", placeholder="Full Name")
+        submitted = st.form_submit_button("Continue")
+        
+        if submitted and identifier and name:
+            user_exists, user_id = check_user_exists(identifier)
+            
+            if user_exists:
+                st.success(f"Welcome back! User ID: {user_id}")
+            else:
+                save_user(identifier, {"name": name})
+                st.success(f"New user registered! User ID: {user_id}")
+            
+            st.session_state.user_exists = True
+            st.session_state.user_id = user_id
+            st.session_state.user_name = name
+            st.rerun()
+    
+    st.stop()
 
 # Custom CSS for better styling
 st.markdown("""
 <style>
-    /* Chat message styling */
     .chat-message {
         padding: 1rem;
         margin: 0.5rem 0;
@@ -234,58 +268,70 @@ st.markdown("""
 with st.sidebar:
     st.header("🤖 Configuration")
     
+    # Show user info
+    if st.session_state.user_exists:
+        st.info(f"User: {st.session_state.get('user_name', 'Unknown')}\nID: {st.session_state.get('user_id', 'Unknown')}")
+    
     # System prompt
     system_prompt = st.text_area(
         "System Prompt",
-        value="""You are Priya, a helpful AI assistant working at Narayan Seva Sansthan (NSS). You answer questions based on provided FAQ context, uploaded documents, and chat history. 
+        value="""You are Priya, an AI assistant at Narayan Seva Sansthan (NSS). 
 
-IMPORTANT GUIDELINES:
-- Only introduce yourself as "Jai Siyaram! I'm Priya, an AI assistant from Narayan Seva Sansthan" for the FIRST message or when greeting new users
-- For follow-up questions in the same conversation, respond naturally without repeating the full introduction
-- Maintain conversation flow by referencing previous messages when relevant
-- Be contextually aware - if someone asks a follow-up question, acknowledge their previous question
-- Provide clear, helpful answers based on the given context
-- Use "Jai Siyaram!" as a greeting only when appropriate (first interaction or after long gaps)
-- Be conversational and natural, not robotic or repetitive
-- Reference uploaded documents when relevant
-- Be concise but comprehensive""",
-        height=250
+Rules:
+- Answer based on the provided complete FAQ knowledge base
+- Be helpful, accurate, and concise
+- Keep responses to 2-3 sentences maximum
+- Don't make up information not in the knowledge base
+- Use "Jai Siyaram!" greeting only for first interaction""",
+        height=150
     )
     
-    # Model selection for Gemini
+    # Model selection - Default to Pro for better large context handling
     model_choice = st.selectbox(
         "Select Gemini Model",
-        ["gemini-flash", "gemini-pro"],
+        ["gemini-pro", "gemini-flash"],
         index=0,
-        help="Flash is faster, Pro is more capable"
+        help="Pro recommended for handling complete FAQ database"
     )
-    
-    # Top-K slider
-    k = st.slider("Top K relevant answers", min_value=1, max_value=10, value=3)
     
     # Clear chat history button
     if st.button("🗑️ Clear Chat History"):
         st.session_state.chat_history = []
         st.session_state.processed_files = set()
-        st.session_state.last_question = ""
         st.success("Chat history cleared!")
+    
+    # Logout button
+    if st.button("🚪 Logout"):
+        st.session_state.user_exists = False
+        st.session_state.chat_history = []
+        st.rerun()
 
-# Load FAQ data
-faq_df = load_faq_embeddings(FAQ_FILE_PATH)
+# Load ALL FAQ data (no limits!)
+faq_text, faq_df = load_faq_data(FAQ_FILE_PATH)
+
+# Display FAQ loading status
+if not faq_df.empty:
+    st.sidebar.success(f"📊 Loaded ALL {len(faq_df)} FAQs successfully!")
+    
+    # Show context size estimation
+    context_size = len(faq_text)
+    st.sidebar.info(f"Context size: ~{context_size:,} characters")
+    
+    if context_size > 100000:
+        st.sidebar.warning("⚠️ Large context - consider using Gemini Pro for better performance")
+else:
+    st.sidebar.error("❌ No FAQ file found! Please add faq.xlsx")
 
 # Function to handle file upload and processing
 def process_uploaded_file(uploaded_file):
     """Process uploaded PDF file and update session state"""
     if uploaded_file is not None:
-        # Create a unique identifier for the file
         file_id = f"{uploaded_file.name}_{uploaded_file.size}"
         
-        # Check if this file has already been processed
         if file_id in st.session_state.processed_files:
             return False
         
         with st.spinner("📖 Processing PDF..."):
-            # Extract text from PDF
             extracted_text = extract_text_from_pdf(uploaded_file)
             
             if extracted_text:
@@ -293,19 +339,14 @@ def process_uploaded_file(uploaded_file):
                 st.session_state.pdf_filename = uploaded_file.name
                 st.session_state.processed_files.add(file_id)
                 
-                # Try to parse as receipt
                 receipt_info = parse_receipt_info(extracted_text)
                 
-                # Add to chat history as a system message
                 receipt_summary = f"📄 Uploaded document: {uploaded_file.name}"
                 if receipt_info:
                     receipt_details = []
                     for key, value in receipt_info.items():
                         if value:
-                            if isinstance(value, list):
-                                receipt_details.append(f"{key.title()}: {', '.join(str(v) for v in value[:2])}")
-                            else:
-                                receipt_details.append(f"{key.title()}: {value}")
+                            receipt_details.append(f"{key.title()}: {value}")
                     if receipt_details:
                         receipt_summary += f"\n🧾 Detected: {', '.join(receipt_details[:3])}"
                 
@@ -316,51 +357,40 @@ def process_uploaded_file(uploaded_file):
                     'type': 'system'
                 })
                 
-                # Automatically add PDF content to knowledge base
-                global faq_df
-                pdf_summary = f"Document: {uploaded_file.name}"
-                faq_df = update_faq(faq_df, pdf_summary, extracted_text[:500] + "...")
-                
                 return True
             else:
-                st.error("❌ Could not extract text from the PDF. Please check if the file is valid.")
+                st.error("❌ Could not extract text from the PDF.")
                 return False
     return False
 
 # Main interface tabs
-tab1, tab2 = st.tabs(["💬 Chat", "➕ Manage Knowledge"])
+tab1, tab2 = st.tabs(["💬 Chat", "📋 Complete Knowledge Base"])
 
 with tab1:
-    st.subheader("Chat with Priya")
+    st.subheader("Chat with Priya - Full FAQ Knowledge Available")
     
     # Display chat history
-    chat_container = st.container()
-    with chat_container:
-        if st.session_state.chat_history:
-            for i, chat in enumerate(st.session_state.chat_history):
-                if chat.get('type') == 'system':
-                    # System messages (file uploads)
-                    st.info(chat['assistant'])
-                else:
-                    # Regular chat messages with better styling
-                    col1, col2 = st.columns([1, 10])
-                    with col2:
-                        st.markdown(f'<div class="chat-message user-message"><strong>You:</strong> {chat["user"]}</div>', unsafe_allow_html=True)
-                        st.markdown(f'<div class="chat-message assistant-message"><strong>Priya:</strong> {chat["assistant"]}</div>', unsafe_allow_html=True)
-                        if i < len(st.session_state.chat_history) - 1:
-                            st.markdown("<br>", unsafe_allow_html=True)
+    if st.session_state.chat_history:
+        for i, chat in enumerate(st.session_state.chat_history):
+            if chat.get('type') == 'system':
+                st.info(chat['assistant'])
+            else:
+                col1, col2 = st.columns([1, 10])
+                with col2:
+                    st.markdown(f'<div class="chat-message user-message"><strong>You:</strong> {chat["user"]}</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="chat-message assistant-message"><strong>Priya:</strong> {chat["assistant"]}</div>', unsafe_allow_html=True)
+                    if i < len(st.session_state.chat_history) - 1:
+                        st.markdown("<br>", unsafe_allow_html=True)
     
-    # Chat input area
     st.markdown("---")
     
-    # Simple file upload
+    # File upload
     uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
     
-    # Create columns for input and send button
+    # Chat input
     col1, col2 = st.columns([9, 1])
     
     with col1:
-        # Use a unique key that changes to clear input
         input_key = f"chat_input_{len(st.session_state.chat_history)}"
         user_question = st.text_input("Ask a question:", key=input_key, label_visibility="collapsed", placeholder="Type your message here...")
     
@@ -373,16 +403,13 @@ with tab1:
             st.success(f"✅ Processed: {uploaded_file.name}")
             st.rerun()
     
-    # Handle text input - auto-clear after sending
+    # Handle text input
     if user_question and send_button:
         with st.spinner("🤔 Priya is thinking..."):
-            # Retrieve relevant FAQs
-            results = retrieve_top_k(user_question, faq_df, k)
-            
-            # Generate AI response
+            # Generate AI response using ALL FAQ data in long context
             ai_response = generate_ai_response(
                 user_question, 
-                results, 
+                faq_text,  # Pass ALL FAQ text directly
                 system_prompt,
                 model_choice,
                 st.session_state.chat_history,
@@ -396,25 +423,9 @@ with tab1:
                 'timestamp': datetime.now().isoformat()
             })
             
-            # Clear the last question to avoid duplication
-            st.session_state.last_question = ""
-            
-            # Rerun to refresh chat and clear input (new key will clear input)
             st.rerun()
     
-    # Show source information for last response if available
-    if st.session_state.chat_history and st.session_state.chat_history[-1].get('type') != 'system':
-        last_user_question = st.session_state.chat_history[-1]['user']
-        results = retrieve_top_k(last_user_question, faq_df, k)
-        if not results.empty:
-            with st.expander("📚 Source Information"):
-                for i, row in results.iterrows():
-                    st.markdown(f"**Q:** {row['Question']}")
-                    st.markdown(f"**A:** {row['Answer']}")
-                    st.caption(f"Similarity: {row['similarity']:.4f}")
-                    st.markdown("---")
-    
-    # Current document status (if any)
+    # Current document status
     if st.session_state.pdf_filename:
         st.sidebar.success(f"📄 Document: {st.session_state.pdf_filename}")
         if st.sidebar.button("🗑️ Remove Document"):
@@ -423,10 +434,48 @@ with tab1:
             st.rerun()
 
 with tab2:
-    st.subheader("➕ Manage Knowledge Base")
+    st.subheader("📋 Complete Knowledge Base")
     
-    # Show current FAQ count
-    st.info(f"📊 Current knowledge base contains {len(faq_df)} entries")
+    if not faq_df.empty:
+        st.success(f"📊 Successfully loaded ALL {len(faq_df)} FAQs using Long Context approach!")
+        
+        # Search through FAQs
+        search_query = st.text_input("🔍 Search FAQs:", placeholder="Type to search questions and answers...")
+        
+        if search_query:
+            # Filter FAQs based on search
+            mask = faq_df['Question'].str.contains(search_query, case=False, na=False) | \
+                   faq_df['Answer'].str.contains(search_query, case=False, na=False)
+            filtered_df = faq_df[mask]
+            st.info(f"Found {len(filtered_df)} FAQs matching '{search_query}'")
+        else:
+            filtered_df = faq_df
+        
+        # Show loaded FAQs with pagination
+        items_per_page = 10
+        total_pages = (len(filtered_df) - 1) // items_per_page + 1
+        
+        if total_pages > 1:
+            page = st.selectbox("Select page:", range(1, total_pages + 1))
+            start_idx = (page - 1) * items_per_page
+            end_idx = start_idx + items_per_page
+            page_df = filtered_df.iloc[start_idx:end_idx]
+        else:
+            page_df = filtered_df
+        
+        st.markdown(f"### Showing FAQs {len(page_df)} of {len(filtered_df)} total:")
+        
+        for i, (idx, row) in enumerate(page_df.iterrows()):
+            with st.expander(f"FAQ {idx+1}: {row['Question'][:80]}{'...' if len(row['Question']) > 80 else ''}"):
+                st.write(f"**Q:** {row['Question']}")
+                st.write(f"**A:** {row['Answer']}")
+                
+                # Show character count for context estimation
+                qa_length = len(row['Question']) + len(row['Answer'])
+                st.caption(f"Length: {qa_length} characters")
+    else:
+        st.error("❌ No FAQ file found. Please add faq.xlsx to your directory.")
+        st.info("The file should have columns: 'Question' and 'Answer'")
     
     # Add new FAQ manually
     with st.form("add_faq"):
@@ -436,48 +485,52 @@ with tab2:
         submitted = st.form_submit_button("Add to Knowledge Base")
         
         if submitted and new_q and new_a:
-            faq_df = update_faq(faq_df, new_q, new_a)
-            st.success("✅ New FAQ added successfully!")
-    
-    # Show current FAQ entries
-    if not faq_df.empty:
-        with st.expander("📋 View All FAQ Entries"):
-            for i, row in faq_df.iterrows():
-                st.write(f"**Q:** {row['Question']}")
-                st.write(f"**A:** {row['Answer']}")
-                st.markdown("---")
+            try:
+                # Append to existing Excel file
+                new_row = pd.DataFrame({'Question': [new_q], 'Answer': [new_a]})
+                if os.path.exists(FAQ_FILE_PATH):
+                    existing_df = pd.read_excel(FAQ_FILE_PATH)
+                    updated_df = pd.concat([existing_df, new_row], ignore_index=True)
+                else:
+                    updated_df = new_row
+                
+                updated_df.to_excel(FAQ_FILE_PATH, index=False)
+                st.success("✅ New FAQ added successfully! Refresh the page to see it.")
+            except Exception as e:
+                st.error(f"Error adding FAQ: {str(e)}")
 
 # Instructions
-with st.expander("📋 How to Use This System"):
-    st.markdown("""
-    ### Features:
-    1. **Chat Interface** - Have continuous conversations with Priya
-    2. **PDF Processing** - Upload receipts, invoices, or documents
-    3. **Receipt Parsing** - Automatically extract key information from receipts
-    4. **Knowledge Management** - Add custom FAQ entries
-    5. **Chat History** - Maintains context across conversations
-    6. **Semantic Search** - Find relevant information from all sources
-    7. **Gemini AI** - Powered by Google's Gemini AI models
+with st.expander("📋 Complete FAQ System Overview"):
+    st.markdown(f"""
+    ### ✨ Complete FAQ Loading System:
     
-    ### How to Use:
-    1. **Start Chatting** - Type your question in the input field
-    2. **Upload Documents** - Click the 📎 icon to upload PDF files
-    3. **Add Knowledge** - Use Manage Knowledge tab to add custom FAQs
-    4. **Configure Settings** - Use sidebar to adjust AI behavior
+    **📊 Current Status:**
+    - 📁 FAQ File: `{FAQ_FILE_PATH}`
+    - 📝 Total FAQs Loaded: **{len(faq_df) if not faq_df.empty else 0}**
+    - 📏 Total Context Size: **~{len(faq_text):,} characters**
+    - 🤖 Recommended Model: **Gemini Pro** (for large contexts)
     
-    ### Setup:
-    1. Replace `GEMINI_API_KEY` with your actual Gemini API key
-    2. Make sure `faq.xlsx` file exists in the same directory
-    3. Install required packages: `pip install streamlit sentence-transformers pandas google-generativeai PyPDF2 pdfplumber pillow pytesseract openpyxl`
+    **🚀 Key Features:**
+    - ✅ **ALL FAQs loaded** - No limits or truncation
+    - ✅ **Smart context management** - Optimized for large datasets
+    - ✅ **Search functionality** - Find specific FAQs quickly
+    - ✅ **Pagination** - Easy browsing of large FAQ collections
+    - ✅ **Real-time addition** - Add new FAQs directly
     
-    ### Supported Document Types:
-    - Receipts and invoices
-    - Reports and documents
-    - Any text-based PDF
+    **🎯 Benefits of Loading All FAQs:**
+    - **Complete Coverage:** AI has access to entire knowledge base
+    - **Better Accuracy:** No relevant information is missed
+    - **Contextual Understanding:** AI can see relationships between FAQs
+    - **No Retrieval Errors:** No risk of missing relevant but "dissimilar" entries
     
-    ### Chat Features:
-    - Maintains conversation history
-    - References uploaded documents
-    - Searches FAQ database
-    - Provides source information
+    **💡 Performance Tips:**
+    - Use **Gemini Pro** for FAQ sets > 50 entries
+    - Monitor context size in sidebar
+    - Consider chunking if FAQ file becomes very large (>500 entries)
+    
+    **🔧 Technical Details:**
+    - Uses Gemini's long context window (up to 1M tokens)
+    - No embeddings or vector search needed
+    - Direct text inclusion in prompt
+    - Efficient caching with `@st.cache_data`
     """)
